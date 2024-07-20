@@ -76,7 +76,7 @@ OPTION( ASSIMP_BUILD_FRAMEWORK
 )
 OPTION( ASSIMP_DOUBLE_PRECISION
   "Set to ON to enable double precision processing"
-  OFF
+  ON
 )
 OPTION( ASSIMP_OPT_BUILD_PACKAGES
   "Set to ON to generate CPack configuration files and packaging targets"
