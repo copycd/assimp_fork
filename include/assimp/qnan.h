@@ -140,8 +140,8 @@ AI_FORCE_INLINE bool is_special_float(float in) {
  *  Denorms return false, they're treated like normal values.
  *  @param in Input value */
 AI_FORCE_INLINE bool is_special_float(double in) {
-   _IEEESingle temp;
-    memcpy(&temp, &in, sizeof(float));
+    _IEEEDouble temp;
+    memcpy(&temp, &in, sizeof(double));
     return (temp.IEEE.Exp == (1u << 11)-1);
 }
 
