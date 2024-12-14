@@ -46,23 +46,42 @@ CMAKE_MINIMUM_REQUIRED( VERSION 3.22 )
 # auto-cloned during build; so MUST disable the feature or the PR will be rejected
 option(ASSIMP_BUILD_USD_IMPORTER "Enable USD file import" off)
 option(ASSIMP_BUILD_USD_VERBOSE_LOGS "Enable verbose USD import debug logging" off)
+option(ASSIMP_BUILD_USE_CCACHE "Use ccache to speed up compilation." on)
 
-# Disabled importers: m3d for 5.1 or later
-ADD_DEFINITIONS( -DASSIMP_BUILD_NO_M3D_IMPORTER)
-ADD_DEFINITIONS( -DASSIMP_BUILD_NO_M3D_EXPORTER)
+if(ASSIMP_BUILD_USE_CCACHE)
+  find_program(CCACHE_PATH ccache)
+  if (CCACHE_PATH)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE_PATH})
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE_PATH})
+  endif()
+endif()
+
+# User may override these in their CMake script to provide M3D import/export support
+# (M3D importer/exporter was disabled for assimp release 5.1 or later)
+option(ASSIMP_BUILD_M3D_IMPORTER "Enable M3D file import" off)
+option(ASSIMP_BUILD_M3D_EXPORTER "Enable M3D file export" off)
+
+# Internal/private M3D logic
+if (NOT ASSIMP_BUILD_M3D_IMPORTER)
+    ADD_DEFINITIONS( -DASSIMP_BUILD_NO_M3D_IMPORTER)
+endif () # if (not ASSIMP_BUILD_M3D_IMPORTER)
+if (NOT ASSIMP_BUILD_M3D_EXPORTER)
+    ADD_DEFINITIONS( -DASSIMP_BUILD_NO_M3D_EXPORTER)
+endif () # if (not ASSIMP_BUILD_M3D_EXPORTER)
+
 # Toggles the use of the hunter package manager
 option(ASSIMP_HUNTER_ENABLED "Enable Hunter package manager support" OFF)
 
 IF(ASSIMP_HUNTER_ENABLED)
   include("cmake-modules/HunterGate.cmake")
   HunterGate(
-    URL "https://github.com/cpp-pm/hunter/archive/v0.25.5.tar.gz"
-    SHA1 "a20151e4c0740ee7d0f9994476856d813cdead29"
+    URL "https://github.com/cpp-pm/hunter/archive/v0.25.8.tar.gz"
+    SHA1 "26c79d587883ec910bce168e25f6ac4595f97033"
   )
   add_definitions(-DASSIMP_USE_HUNTER)
 ENDIF()
 
-PROJECT(Assimp VERSION 5.4.1)
+PROJECT(Assimp VERSION 5.4.3)
 
 # All supported options ###############################################
 
@@ -154,7 +173,7 @@ IF (WIN32)
 
   IF(MSVC)
     OPTION( ASSIMP_INSTALL_PDB
-      "Install MSVC debug files."
+      "Create MSVC debug symbol files and add to Install target."
       ON )
     IF(NOT (MSVC_VERSION LESS 1900))
       # Multibyte character set has been deprecated since at least MSVC2015 (possibly earlier)
@@ -270,7 +289,7 @@ IF ((CMAKE_C_COMPILER_ID MATCHES "GNU") AND NOT MINGW AND NOT HAIKU)
     SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
   ENDIF()
 
-  IF(CMAKE_CXX_COMPILER_VERSION GREATER_EQUAL 13)
+  IF(CMAKE_CXX_COMPILER_VERSION GREATER_EQUAL 13 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     MESSAGE(STATUS "GCC13 detected disabling \"-Wdangling-reference\" in Cpp files as it appears to be a false positive")
     ADD_COMPILE_OPTIONS("$<$<COMPILE_LANGUAGE:CXX>:-Wno-dangling-reference>")
   ENDIF()
@@ -299,8 +318,15 @@ ELSEIF(MSVC)
   # supress warning for double to float conversion if Double precision is activated
   ADD_COMPILE_OPTIONS(/wd4244)
   SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /D_DEBUG /Zi /Od")
-  SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
-  SET(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG:FULL /PDBALTPATH:%_PDB% /OPT:REF /OPT:ICF")
+  # Allow user to disable PDBs
+  if(ASSIMP_INSTALL_PDB)
+    SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Zi")
+    SET(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG:FULL /PDBALTPATH:%_PDB% /OPT:REF /OPT:ICF")
+  elseif((GENERATOR_IS_MULTI_CONFIG) OR (CMAKE_BUILD_TYPE MATCHES Release))
+    message("-- MSVC PDB generation disabled. Release binary will not be debuggable.")
+  endif()
+  # Source code is encoded in UTF-8
+  ADD_COMPILE_OPTIONS(/source-charset:utf-8)
 ELSEIF (CMAKE_CXX_COMPILER_ID MATCHES "Clang" )
   IF(NOT ASSIMP_HUNTER_ENABLED)
     SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -643,7 +669,7 @@ ELSE()
   IF ( ASSIMP_BUILD_DRACO )
     # Primarily for glTF v2
     # Enable Draco glTF feature set
-    set(DRACO_GLTF ON CACHE BOOL "" FORCE)
+    set(DRACO_GLTF_BITSTREAM ON CACHE BOOL "" FORCE)
     # Disable unnecessary or omitted components
     set(DRACO_JS_GLUE OFF CACHE BOOL "" FORCE)
     set(DRACO_WASM OFF CACHE BOOL "" FORCE)

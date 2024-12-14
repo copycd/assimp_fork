@@ -294,6 +294,8 @@ inline void SetDecodedIndexBuffer_Draco(const draco::Mesh &dracoMesh, Mesh::Prim
     // Usually uint32_t but shouldn't assume
     if (sizeof(dracoMesh.face(draco::FaceIndex(0))[0]) == componentBytes) {
         memcpy(decodedIndexBuffer->GetPointer(), &dracoMesh.face(draco::FaceIndex(0))[0], decodedIndexBuffer->byteLength);
+        // Assign this alternate data buffer to the accessor
+        prim.indices->decodedBuffer.swap(decodedIndexBuffer);
         return;
     }
 
@@ -1036,10 +1038,10 @@ size_t Accessor::ExtractData(T *&outData, const std::vector<unsigned int> *remap
     outData = new T[usedCount];
 
     if (remappingIndices != nullptr) {
-        const unsigned int maxIndex = static_cast<unsigned int>(maxSize / stride - 1);
+        const unsigned int maxIndexCount = static_cast<unsigned int>(maxSize / stride);
         for (size_t i = 0; i < usedCount; ++i) {
             size_t srcIdx = (*remappingIndices)[i];
-            if (srcIdx > maxIndex) {
+            if (srcIdx >= maxIndexCount) {
                 throw DeadlyImportError("GLTF: index*stride ", (srcIdx * stride), " > maxSize ", maxSize, " in ", getContextForErrorMessages(id, name));
             }
             memcpy(outData + i, data + srcIdx * stride, elemSize);
