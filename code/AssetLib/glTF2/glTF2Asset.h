@@ -519,6 +519,12 @@ public:
 
     uint8_t *GetPointer() { return mData.get(); }
 
+    void AllocateZeroed(size_t length) {
+        byteLength = length;
+        capacity = length;
+        mData.reset(new uint8_t[length](), std::default_delete<uint8_t[]>());
+    }
+
     void MarkAsSpecial() { mIsSpecial = true; }
 
     bool IsSpecial() const override { return mIsSpecial; }
@@ -539,6 +545,7 @@ struct BufferView : public Object {
 
     void Read(Value &obj, Asset &r);
     uint8_t *GetPointerAndTailSize(size_t accOffset, size_t& outTailSize);
+    void DecodeMeshopt(Value &moObj, Asset &r);
 };
 
 //! A typed view into a BufferView. A BufferView contains raw binary data.
@@ -567,6 +574,8 @@ struct Accessor : public Object {
 
     template <class T>
     size_t ExtractData(T *&outData, const std::vector<unsigned int> *remappingIndices = nullptr);
+    template <class T>
+    size_t ExtractData_Original(T *&outData, const std::vector<unsigned int> *remappingIndices = nullptr);
 
     void WriteData(size_t count, const void *src_buffer, size_t src_stride);
     void WriteSparseValues(size_t count, const void *src_data, size_t src_dataStride);
@@ -1138,6 +1147,8 @@ public:
         bool FB_ngon_encoding{false};
         bool KHR_texture_basisu{false};
         bool EXT_texture_webp{false};
+        bool EXT_meshopt_compression{false};
+        bool KHR_mesh_quantization{false};
 
         Extensions() = default;
         ~Extensions() = default;
@@ -1148,6 +1159,8 @@ public:
         bool KHR_draco_mesh_compression{false};
         bool KHR_texture_basisu{false};
         bool EXT_texture_webp{false};
+        bool EXT_meshopt_compression{false};
+        bool KHR_mesh_quantization{false};
 
         RequiredExtensions() = default;
     } extensionsRequired;

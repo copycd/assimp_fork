@@ -82,6 +82,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #   error glTF: KHR_draco_mesh_compression: draco library must have DRACO_MESH_COMPRESSION_SUPPORTED
 #endif
 #endif
+#ifdef ASSIMP_ENABLE_MESHOPT
+#include "meshoptimizer.h"
+#endif
 // clang-format on
 
 using namespace Assimp;
@@ -577,6 +580,14 @@ inline void Buffer::Read(Value &obj, Asset &r) {
     Value *it = FindString(obj, "uri");
     if (!it) {
         if (statedLength > 0) {
+            if (Value *meshoptExt = FindObject(obj, "extensions")) {
+                if (Value *fallbackObj = FindObject(*meshoptExt, "EXT_meshopt_compression")) {
+                    if (MemberOrDefault(*fallbackObj, "fallback", false)) {
+                        AllocateZeroed(statedLength);
+                        return;
+                    }
+                }
+            }
             throw DeadlyImportError("GLTF: buffer with non-zero length missing the \"uri\" attribute");
         }
         return;
@@ -779,6 +790,117 @@ inline void BufferView::Read(Value &obj, Asset &r) {
     if ((byteOffset + byteLength) > buffer->byteLength) {
         throw DeadlyImportError("GLTF: Buffer view with offset/length (", byteOffset, "/", byteLength, ") is out of range.");
     }
+
+    // EXT_meshopt_compression: this view is a window into a zero-filled fallback buffer,
+    // the real bytes have to be decoded into it from a second, compressed buffer.
+    if (Value *extensions = FindObject(obj, "extensions")) {
+        if (Value *meshopt = FindObject(*extensions, "EXT_meshopt_compression")) {
+            DecodeMeshopt(*meshopt, r);
+        }
+    }
+}
+
+inline void BufferView::DecodeMeshopt(Value &moObj, Asset &r) {
+#ifdef ASSIMP_ENABLE_MESHOPT
+    Value *srcBufferVal = FindUInt(moObj, "buffer");
+    if (nullptr == srcBufferVal) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression without a source buffer in ", id, ".");
+    }
+
+    Ref<Buffer> srcBuffer = r.buffers.Retrieve(srcBufferVal->GetUint());
+    if (!srcBuffer || nullptr == srcBuffer->GetPointer()) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression refers to a buffer without data in ", id, ".");
+    }
+
+    const size_t srcOffset = MemberOrDefault(moObj, "byteOffset", size_t(0));
+    const size_t srcLength = MemberOrDefault(moObj, "byteLength", size_t(0));
+    const size_t elemCount = MemberOrDefault(moObj, "count", size_t(0));
+    const size_t elemStride = MemberOrDefault(moObj, "byteStride", size_t(0));
+    const std::string mode = MemberOrDefault(moObj, "mode", std::string());
+    const std::string filter = MemberOrDefault(moObj, "filter", std::string("NONE"));
+
+    if (elemCount == 0 || elemStride == 0) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression with a zero count or byteStride in ", id, ".");
+    }
+
+    if (srcLength == 0 || srcOffset > srcBuffer->byteLength || srcLength > srcBuffer->byteLength - srcOffset) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression source range (", srcOffset, "/", srcLength,
+                ") is out of range in ", id, ".");
+    }
+
+    // The decoder always writes count * byteStride bytes. Written as a division so the
+    // product itself cannot overflow on a malformed file.
+    if (elemStride > byteLength / elemCount) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression decodes ", elemCount, " x ", elemStride,
+                " bytes, which does not fit the ", byteLength, " bytes of ", id, ".");
+    }
+
+    uint8_t *const bufferData = buffer->GetPointer();
+    if (nullptr == bufferData) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression without a fallback buffer in ", id, ".");
+    }
+
+    uint8_t *const dst = bufferData + byteOffset;
+    const unsigned char *const src = srcBuffer->GetPointer() + srcOffset;
+
+    // The decoders assert on the constraints below instead of reporting them, so they are
+    // checked here rather than let a malformed file abort a debug build.
+    int res;
+    if (mode == "ATTRIBUTES") {
+        if (elemStride > 256 || (elemStride % 4) != 0) {
+            throw DeadlyImportError("GLTF: EXT_meshopt_compression ATTRIBUTES byteStride must be a multiple of 4 and at most 256, got ",
+                    elemStride, " in ", id, ".");
+        }
+        res = meshopt_decodeVertexBuffer(dst, elemCount, elemStride, src, srcLength);
+    } else if (mode == "TRIANGLES" || mode == "INDICES") {
+        if (elemStride != 2 && elemStride != 4) {
+            throw DeadlyImportError("GLTF: EXT_meshopt_compression index byteStride must be 2 or 4, got ", elemStride, " in ", id, ".");
+        }
+        if (mode == "TRIANGLES") {
+            if ((elemCount % 3) != 0) {
+                throw DeadlyImportError("GLTF: EXT_meshopt_compression TRIANGLES count must be a multiple of 3, got ",
+                        elemCount, " in ", id, ".");
+            }
+            res = meshopt_decodeIndexBuffer(dst, elemCount, elemStride, src, srcLength);
+        } else {
+            res = meshopt_decodeIndexSequence(dst, elemCount, elemStride, src, srcLength);
+        }
+    } else {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression with an unsupported mode \"", mode, "\" in ", id, ".");
+    }
+
+    if (res != 0) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression failed to decode ", id, " (mode ", mode, ", error ", res, ").");
+    }
+
+    if (filter == "NONE") {
+        // Nothing to undo.
+    } else if (filter == "OCTAHEDRAL") {
+        if (elemStride != 4 && elemStride != 8) {
+            throw DeadlyImportError("GLTF: EXT_meshopt_compression OCTAHEDRAL filter needs a byteStride of 4 or 8, got ",
+                    elemStride, " in ", id, ".");
+        }
+        meshopt_decodeFilterOct(dst, elemCount, elemStride);
+    } else if (filter == "QUATERNION") {
+        if (elemStride != 8) {
+            throw DeadlyImportError("GLTF: EXT_meshopt_compression QUATERNION filter needs a byteStride of 8, got ",
+                    elemStride, " in ", id, ".");
+        }
+        meshopt_decodeFilterQuat(dst, elemCount, elemStride);
+    } else if (filter == "EXPONENTIAL") {
+        if ((elemStride % 4) != 0) {
+            throw DeadlyImportError("GLTF: EXT_meshopt_compression EXPONENTIAL filter needs a byteStride that is a multiple of 4, got ",
+                    elemStride, " in ", id, ".");
+        }
+        meshopt_decodeFilterExp(dst, elemCount, elemStride);
+    } else {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression with an unsupported filter \"", filter, "\" in ", id, ".");
+    }
+#else
+    (void)moObj;
+    (void)r;
+    throw DeadlyImportError("GLTF: EXT_meshopt_compression is not supported by this build of assimp, cannot decode ", id, ".");
+#endif // ASSIMP_ENABLE_MESHOPT
 }
 
 inline uint8_t *BufferView::GetPointerAndTailSize(size_t accOffset, size_t& outTailSize) {
@@ -1037,8 +1159,68 @@ inline size_t Accessor::GetMaxByteSize() {
     return 0;
 }
 
+// Reads one component of a possibly quantized attribute (KHR_mesh_quantization, or any
+// plain normalized integer stream) and returns it in its dequantized form. Normalized
+// signed types are clamped at -1 as required by the glTF spec.
+static inline double ReadQuantizedComponent(const uint8_t *p, ComponentType ct, bool normalized) {
+    switch (ct) {
+    case ComponentType_BYTE: {
+        int8_t v;
+        memcpy(&v, p, sizeof(v));
+        const double d = static_cast<double>(v);
+        return normalized ? (d / 127.0 < -1.0 ? -1.0 : d / 127.0) : d;
+    }
+    case ComponentType_UNSIGNED_BYTE: {
+        uint8_t v;
+        memcpy(&v, p, sizeof(v));
+        const double d = static_cast<double>(v);
+        return normalized ? d / 255.0 : d;
+    }
+    case ComponentType_SHORT: {
+        int16_t v;
+        memcpy(&v, p, sizeof(v));
+        const double d = static_cast<double>(v);
+        return normalized ? (d / 32767.0 < -1.0 ? -1.0 : d / 32767.0) : d;
+    }
+    case ComponentType_UNSIGNED_SHORT: {
+        uint16_t v;
+        memcpy(&v, p, sizeof(v));
+        const double d = static_cast<double>(v);
+        return normalized ? d / 65535.0 : d;
+    }
+    case ComponentType_UNSIGNED_INT: {
+        uint32_t v;
+        memcpy(&v, p, sizeof(v));
+        const double d = static_cast<double>(v);
+        return normalized ? d / 4294967295.0 : d;
+    }
+    case ComponentType_FLOAT: {
+        float v;
+        memcpy(&v, p, sizeof(v));
+        return static_cast<double>(v);
+    }
+    default:
+        return 0.0;
+    }
+}
+
 template <class T>
 size_t Accessor::ExtractData(T *&outData, const std::vector<unsigned int> *remappingIndices) {
+    // A component type other than FLOAT means the stream is quantized, so the raw bytes
+    // cannot simply be memcpy'd into float storage - every component has to be converted.
+    //
+    // This only applies when the destination actually is float storage. Several call sites
+    // in glTF2Importer deliberately read the raw integers into a matching integer type
+    // (vertex colors, joint indices, packed quaternions, morph weights) and dequantize
+    // themselves; those have to keep using the raw path.
+    const unsigned int numComponents = GetNumComponents();
+    const bool destIsFloats = (sizeof(T) % sizeof(ai_real)) == 0 &&
+                              sizeof(T) >= numComponents * sizeof(ai_real);
+
+    if (componentType == ComponentType_FLOAT || !destIsFloats) {
+        return ExtractData_Original(outData, remappingIndices);
+    }
+
     uint8_t *data = GetPointer();
     if (!data) {
         throw DeadlyImportError("GLTF2: data is null when extracting data from ", getContextForErrorMessages(id, name));
@@ -1046,16 +1228,7 @@ size_t Accessor::ExtractData(T *&outData, const std::vector<unsigned int> *remap
 
     const size_t usedCount = (remappingIndices != nullptr) ? remappingIndices->size() : count;
     const size_t elemSize = GetElementSize();
-    const size_t totalSize = elemSize * usedCount;
-
     const size_t stride = GetStride();
-
-    const size_t targetElemSize = sizeof(T);
-
-    if (elemSize > targetElemSize) {
-        throw DeadlyImportError("GLTF: elemSize ", elemSize, " > targetElemSize ", targetElemSize, " in ", getContextForErrorMessages(id, name));
-    }
-
     const size_t maxSize = GetMaxByteSize();
 
     if (elemSize > maxSize) {
@@ -1068,25 +1241,32 @@ size_t Accessor::ExtractData(T *&outData, const std::vector<unsigned int> *remap
         throw DeadlyImportError("GLTF: count ", count, " > maxCount ", maxCount, " in ", getContextForErrorMessages(id, name));
     }
 
+    const size_t bytesPerComponent = GetBytesPerComponent();
+
+    // MAT4 is the widest element glTF has. Components beyond what T can hold are dropped,
+    // which is how a VEC2 texture coordinate keeps the zero z of a default aiVector3D.
+    constexpr unsigned int MaxComponents = 16;
+    const unsigned int writtenComponents = numComponents < MaxComponents ? numComponents : MaxComponents;
+
     outData = new T[usedCount];
 
-    if (remappingIndices != nullptr) {
-        for (size_t i = 0; i < usedCount; ++i) {
-            size_t srcIdx = (*remappingIndices)[i];
+    for (size_t i = 0; i < usedCount; ++i) {
+        size_t srcIdx = i;
+        if (remappingIndices != nullptr) {
+            srcIdx = (*remappingIndices)[i];
             if (srcIdx >= count) {
                 throw DeadlyImportError("GLTF: index ", srcIdx, " >= count ", count, " in ", getContextForErrorMessages(id, name));
             }
-            memcpy(outData + i, data + srcIdx * stride, elemSize);
         }
-    } else { // non-indexed cases
-        if (stride == elemSize && targetElemSize == elemSize) {
-            memcpy(outData, data, totalSize);
-        } else {
-            for (size_t i = 0; i < usedCount; ++i) {
-                memcpy(outData + i, data + i * stride, elemSize);
-            }
+
+        const uint8_t *src = data + srcIdx * stride;
+        ai_real converted[MaxComponents] = {};
+        for (unsigned int c = 0; c < writtenComponents; ++c) {
+            converted[c] = static_cast<ai_real>(ReadQuantizedComponent(src + c * bytesPerComponent, componentType, normalized));
         }
+        memcpy(outData + i, converted, writtenComponents * sizeof(ai_real));
     }
+
     return usedCount;
 }
 
@@ -2136,6 +2316,14 @@ inline void Asset::Load(const std::string &pFile, bool isBinary)
     }
 #endif
 
+#ifndef ASSIMP_ENABLE_MESHOPT
+    // Without the decoder the fallback buffer would stay zero-filled and the file would
+    // import as a degenerate mesh, so refuse it instead.
+    if (extensionsRequired.EXT_meshopt_compression) {
+        throw DeadlyImportError("GLTF: EXT_meshopt_compression not supported.");
+    }
+#endif
+
     // Prepare the dictionaries
     for (size_t i = 0; i < mDicts.size(); ++i) {
         mDicts[i]->AttachToDocument(doc);
@@ -2224,6 +2412,8 @@ inline void Asset::ReadExtensionsRequired(Document &doc) {
     CHECK_REQUIRED_EXT(KHR_draco_mesh_compression);
     CHECK_REQUIRED_EXT(KHR_texture_basisu);
     CHECK_REQUIRED_EXT(EXT_texture_webp);
+    CHECK_REQUIRED_EXT(EXT_meshopt_compression);
+    CHECK_REQUIRED_EXT(KHR_mesh_quantization);
 
 #undef CHECK_REQUIRED_EXT
 }
@@ -2255,6 +2445,8 @@ inline void Asset::ReadExtensionsUsed(Document &doc) {
     CHECK_EXT(KHR_draco_mesh_compression);
     CHECK_EXT(KHR_texture_basisu);
     CHECK_EXT(EXT_texture_webp);
+    CHECK_EXT(EXT_meshopt_compression);
+    CHECK_EXT(KHR_mesh_quantization);
 
 #undef CHECK_EXT
 }

@@ -1151,3 +1151,81 @@ TEST_F(utglTF2ImportExport, importMalformedSparseAccessor) {
     std::string errorString = importer.GetErrorString();
     EXPECT_NE(errorString.find("Invalid sparse accessor: missing required 'values' object."), std::string::npos);
 }
+
+
+TEST_F(utglTF2ImportExport, importMeshOptQuantized) {
+    ::Assimp::Importer importer;
+    const aiScene *scene = importer.ReadFile(ASSIMP_TEST_MODELS_DIR "/glTF2/meshOpt/447195_34.glb", aiProcess_ValidateDataStructure);
+    ASSERT_NE(nullptr, scene) << importer.GetErrorString();
+    ASSERT_EQ(1u, scene->mNumMeshes);
+
+    const aiMesh *mesh = scene->mMeshes[0];
+    EXPECT_EQ(216u, mesh->mNumVertices);
+    EXPECT_EQ(108u, mesh->mNumFaces);
+    ASSERT_TRUE(mesh->HasNormals());
+
+    // Checking the mesh count alone does not catch a failed decompression: when the
+    // decode fails the fallback buffer stays zeroed, so every vertex collapses onto
+    // the origin while the mesh count is still 1. Check the coordinates instead.
+    bool anyNonZero = false;
+    for (unsigned int i = 0; i < mesh->mNumVertices && !anyNonZero; ++i) {
+        const aiVector3D &v = mesh->mVertices[i];
+        anyNonZero = (v.x != 0.0 || v.y != 0.0 || v.z != 0.0);
+    }
+    EXPECT_TRUE(anyNonZero) << "All vertices are zero - meshopt decompression did not run.";
+
+    // Normals are quantized as VEC3/BYTE (normalized). If ExtractData ignores the
+    // componentType it raw-memcpys 3 bytes into a 24-byte vector and they all end up
+    // as zero (which is what happened). Check for unit length instead.
+    unsigned int degenerateNormals = 0;
+    for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+        if (std::abs(mesh->mNormals[i].Length() - 1.0) > 0.02) {
+            ++degenerateNormals;
+        }
+    }
+    EXPECT_EQ(0u, degenerateNormals) << "Normals are not unit length - dequantization did not run.";
+
+    // The index buffer is meshopt-compressed as well and lives in the same fallback buffer.
+    // Without a decode every index reads back as 0, which does not change the face count
+    // (it is derived from the index count) but does make every face degenerate.
+    unsigned int degenerateFaces = 0;
+    for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+        const aiFace &face = mesh->mFaces[i];
+        ASSERT_EQ(3u, face.mNumIndices);
+        if (face.mIndices[0] == face.mIndices[1] || face.mIndices[1] == face.mIndices[2] ||
+                face.mIndices[0] == face.mIndices[2]) {
+            ++degenerateFaces;
+        }
+    }
+    EXPECT_EQ(0u, degenerateFaces) << "All faces are degenerate - the meshopt index buffer was not decoded.";
+
+    // The POSITION accessor carries its own quantized bounding box (min/max in the glTF),
+    // so a correct decode has to reproduce it exactly. This is the check that catches a
+    // decode producing plausible-looking but wrong numbers, which the tests above cannot.
+    aiVector3D minPos = mesh->mVertices[0];
+    aiVector3D maxPos = mesh->mVertices[0];
+    for (unsigned int i = 1; i < mesh->mNumVertices; ++i) {
+        const aiVector3D &v = mesh->mVertices[i];
+        if (v.x < minPos.x) minPos.x = v.x;
+        if (v.y < minPos.y) minPos.y = v.y;
+        if (v.z < minPos.z) minPos.z = v.z;
+        if (v.x > maxPos.x) maxPos.x = v.x;
+        if (v.y > maxPos.y) maxPos.y = v.y;
+        if (v.z > maxPos.z) maxPos.z = v.z;
+    }
+    EXPECT_NEAR(0.0, minPos.x, 1e-3);
+    EXPECT_NEAR(0.0, minPos.y, 1e-3);
+    EXPECT_NEAR(0.0, minPos.z, 1e-3);
+    EXPECT_NEAR(16248.0, maxPos.x, 1e-3);
+    EXPECT_NEAR(14776.0, maxPos.y, 1e-3);
+    EXPECT_NEAR(16383.0, maxPos.z, 1e-3);
+
+    // Vertices live in quantized integer space (0..16383); the real coordinates come
+    // from the node TRS. Losing that transform blows the model up 16000x, so check it too.
+    const aiNode *node = scene->mRootNode;
+    ASSERT_EQ(1u, node->mNumMeshes);
+    EXPECT_NEAR(0.00116571, node->mTransformation.a1, 1e-7);
+    EXPECT_NEAR(0.00116571, node->mTransformation.b2, 1e-7);
+    EXPECT_NEAR(0.00116571, node->mTransformation.c3, 1e-7);
+    EXPECT_NEAR(-9.469959, node->mTransformation.a4, 1e-4);
+}

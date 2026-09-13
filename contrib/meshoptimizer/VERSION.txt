@@ -1,0 +1,37 @@
+copycd:: meshoptimizer 디코더 벤더링 기록
+
+용도
+  glTF2 임포터의 EXT_meshopt_compression 압축 해제.
+  code/AssetLib/glTF2/glTF2Asset.inl 의 BufferView 로드 경로에서 쓴다.
+
+가져온 곳
+  D:\GitHub\CCd.Meshoptimizer   (사내 meshoptimizer 포크)
+  commit  62482488739e4cf3fe6342198900d22ec01f5b2b   (2026-09-10)
+  MESHOPTIMIZER_VERSION 1020  (1.2)
+  가져온 날짜 2026-09-11
+
+가져온 파일 (전부 src/ 에서 그대로 복사, 수정 없음)
+  meshoptimizer.h     공용 헤더
+  vertexcodec.cpp     meshopt_decodeVertexBuffer
+  indexcodec.cpp      meshopt_decodeIndexBuffer / meshopt_decodeIndexSequence
+  vertexfilter.cpp    meshopt_decodeFilterOct / Quat / Exp / Color
+  LICENSE.md          MIT
+
+왜 소스를 넣었나 (lib 링크가 아니라)
+  - 외부 의존성이 0 이다. assert/string/math/stdint 와 SIMD 내장 헤더만 쓴다.
+    나머지 20여 개 .cpp(simplifier, clusterizer 등)와 독립이라 이 4개만으로 디코드가 된다.
+  - contrib/draco 와 같은 방식이다. heliosen.assimp.so/dll 안에 함께 빌드되므로
+    배포 파일이 늘지 않는다.
+  - 별도 .so 로 링크하면 libdraco.so.9 에서 겪은 일(SONAME, 심볼릭 링크, nupkg 가
+    링크를 보존하지 않는 문제, C# 쪽 dlopen RTLD_GLOBAL 선행 로드)을 한 번 더
+    반복해야 한다.
+  - CCd.Meshoptimizer 는 Docker 이미지로 납품되는 도구(gltfpack)다. 라이브러리로
+    링크하면 독립적으로 납품되는 두 산출물이 결합된다.
+
+갱신할 때
+  1) 위 4개 파일을 다시 복사하고 이 파일의 commit / 날짜 / VERSION 을 갱신한다.
+  2) 원본을 수정하지 말 것. 수정이 필요하면 assimp 쪽(glTF2Asset.inl)에서 해결한다.
+     그래야 다음 갱신 때 그냥 덮어쓸 수 있다.
+  3) 비트스트림 호환: 디코더는 meshopt_decodeVertexVersion / meshopt_decodeIndexVersion
+     으로 스트림 버전을 보고 v0/v1 을 모두 읽는다. 인코더(gltfpack)가 더 새로운
+     버전을 쓰기 시작하면 여기도 올려야 한다.
