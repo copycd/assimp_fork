@@ -83,6 +83,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #   error glTF: KHR_draco_mesh_compression: draco library must have DRACO_MESH_COMPRESSION_SUPPORTED
 #endif
 #endif
+
+#ifdef ASSIMP_ENABLE_MESHOPT
+#   include "meshoptimizer.h"
+#endif
 // clang-format on
 
 using namespace Assimp;
@@ -229,6 +233,15 @@ inline bool GetAttribTargetVector(Mesh::Primitive &p, const int targetIndex, con
     } else
         return false;
     return true;
+}
+
+// EXT_meshopt_compression and KHR_meshopt_compression use the same extension object
+// for buffers and buffer views, so both names are accepted.
+inline Value *FindMeshoptExtension(Value &extensions) {
+    if (Value *ext = FindObject(extensions, "EXT_meshopt_compression")) {
+        return ext;
+    }
+    return FindObject(extensions, "KHR_meshopt_compression");
 }
 
 } // namespace
@@ -578,6 +591,16 @@ inline void Buffer::Read(Value &obj, Asset &r) {
     Value *it = FindString(obj, "uri");
     if (!it) {
         if (statedLength > 0) {
+            // A meshopt fallback buffer may have no "uri": its content is produced by decoding
+            // the compressed buffer views that point to it (see BufferView::DecodeMeshopt).
+            if (Value *extensions = FindObject(obj, "extensions")) {
+                if (Value *meshopt = FindMeshoptExtension(*extensions)) {
+                    if (MemberOrDefault(*meshopt, "fallback", false)) {
+                        AllocateZeroed(statedLength);
+                        return;
+                    }
+                }
+            }
             throw DeadlyImportError("GLTF: buffer with non-zero length missing the \"uri\" attribute");
         }
         return;
@@ -780,6 +803,106 @@ inline void BufferView::Read(Value &obj, Asset &r) {
     if ((byteOffset + byteLength) > buffer->byteLength) {
         throw DeadlyImportError("GLTF: Buffer view with offset/length (", byteOffset, "/", byteLength, ") is out of range.");
     }
+
+    // EXT_meshopt_compression / KHR_meshopt_compression work on buffer views: the compressed
+    // data is decoded into this view's (fallback) buffer, so accessors and everything after
+    // them read it like uncompressed data.
+    if (Value *extensions = FindObject(obj, "extensions")) {
+        if (Value *meshopt = FindMeshoptExtension(*extensions)) {
+            DecodeMeshopt(*meshopt, r);
+        }
+    }
+}
+
+inline void BufferView::DecodeMeshopt(Value &extension, Asset &r) {
+#ifndef ASSIMP_ENABLE_MESHOPT
+    // Built without the decoder: keep the fallback data. Files that require the extension
+    // are rejected in Asset::Load.
+    (void)extension;
+    (void)r;
+#else
+    Ref<Buffer> source;
+    if (Value *bufferVal = FindUInt(extension, "buffer")) {
+        source = r.buffers.Retrieve(bufferVal->GetUint());
+    }
+    if (!source) {
+        throw DeadlyImportError("GLTF: meshopt compression: buffer view ", id, " has no valid source buffer.");
+    }
+
+    const size_t srcOffset = MemberOrDefault(extension, "byteOffset", size_t(0));
+    const size_t srcLength = MemberOrDefault(extension, "byteLength", size_t(0));
+    const size_t count = MemberOrDefault(extension, "count", size_t(0));
+    const size_t stride = MemberOrDefault(extension, "byteStride", size_t(0));
+    const std::string mode = MemberOrDefault(extension, "mode", std::string());
+    const std::string filter = MemberOrDefault(extension, "filter", std::string("NONE"));
+
+    if (count == 0 || stride == 0) {
+        throw DeadlyImportError("GLTF: meshopt compression: buffer view ", id, " has no count or byteStride.");
+    }
+
+    // All values come from the file, so the range checks are written to avoid overflow.
+    if (srcOffset > source->byteLength || srcLength > source->byteLength - srcOffset) {
+        throw DeadlyImportError("GLTF: meshopt compression: compressed data of buffer view ", id, " is out of range.");
+    }
+    if (byteOffset > buffer->byteLength || byteLength > buffer->byteLength - byteOffset) {
+        throw DeadlyImportError("GLTF: meshopt compression: buffer view ", id, " is out of range.");
+    }
+    if (stride > byteLength / count) {
+        throw DeadlyImportError("GLTF: meshopt compression: decoded data does not fit into buffer view ", id, ".");
+    }
+
+    const uint8_t *srcBase = source->GetPointer();
+    uint8_t *dstBase = buffer->GetPointer();
+    if (srcBase == nullptr || dstBase == nullptr) {
+        throw DeadlyImportError("GLTF: meshopt compression: buffer view ", id, " has no buffer data.");
+    }
+    const unsigned char *src = srcBase + srcOffset;
+    uint8_t *dst = dstBase + byteOffset;
+
+    // meshoptimizer checks the stride and count constraints below only with assert(), so they
+    // must be validated here; e.g. an ATTRIBUTES stride above 256 would overflow a stack buffer
+    // in meshopt_decodeVertexBuffer.
+    int result = -1;
+    if (mode == "ATTRIBUTES") {
+        if (stride > 256 || stride % 4 != 0) {
+            throw DeadlyImportError("GLTF: meshopt compression: invalid byteStride ", stride, " for ATTRIBUTES in buffer view ", id, ".");
+        }
+        result = meshopt_decodeVertexBuffer(dst, count, stride, src, srcLength);
+    } else if (mode == "TRIANGLES") {
+        if ((stride != 2 && stride != 4) || count % 3 != 0) {
+            throw DeadlyImportError("GLTF: meshopt compression: invalid byteStride ", stride, " or count ", count, " for TRIANGLES in buffer view ", id, ".");
+        }
+        result = meshopt_decodeIndexBuffer(dst, count, stride, src, srcLength);
+    } else if (mode == "INDICES") {
+        if (stride != 2 && stride != 4) {
+            throw DeadlyImportError("GLTF: meshopt compression: invalid byteStride ", stride, " for INDICES in buffer view ", id, ".");
+        }
+        result = meshopt_decodeIndexSequence(dst, count, stride, src, srcLength);
+    } else {
+        throw DeadlyImportError("GLTF: meshopt compression: unknown mode \"", mode, "\" in buffer view ", id, ".");
+    }
+
+    if (result != 0) {
+        throw DeadlyImportError("GLTF: meshopt compression: failed to decode buffer view ", id, " (mode ", mode, ", error ", result, ").");
+    }
+
+    // Filters are applied in place after decoding. They are only valid for ATTRIBUTES.
+    if (filter == "NONE") {
+        // nothing to do
+    } else if (mode != "ATTRIBUTES") {
+        throw DeadlyImportError("GLTF: meshopt compression: filter \"", filter, "\" is not allowed for mode ", mode, " in buffer view ", id, ".");
+    } else if (filter == "OCTAHEDRAL" && (stride == 4 || stride == 8)) {
+        meshopt_decodeFilterOct(dst, count, stride);
+    } else if (filter == "QUATERNION" && stride == 8) {
+        meshopt_decodeFilterQuat(dst, count, stride);
+    } else if (filter == "EXPONENTIAL" && stride % 4 == 0) {
+        meshopt_decodeFilterExp(dst, count, stride);
+    } else if (filter == "COLOR" && (stride == 4 || stride == 8)) {
+        meshopt_decodeFilterColor(dst, count, stride);
+    } else {
+        throw DeadlyImportError("GLTF: meshopt compression: unknown filter \"", filter, "\" or invalid byteStride ", stride, " in buffer view ", id, ".");
+    }
+#endif
 }
 
 inline uint8_t *BufferView::GetPointerAndTailSize(size_t accOffset, size_t& outTailSize) {
@@ -2158,6 +2281,13 @@ inline void Asset::Load(const std::string &pFile, bool isBinary)
     }
 #endif
 
+#ifndef ASSIMP_ENABLE_MESHOPT
+    // Is meshopt required?
+    if (extensionsRequired.EXT_meshopt_compression || extensionsRequired.KHR_meshopt_compression) {
+        throw DeadlyImportError("GLTF: Meshopt compression not supported (assimp was built with ASSIMP_BUILD_MESHOPT=OFF).");
+    }
+#endif
+
     // Prepare the dictionaries
     for (size_t i = 0; i < mDicts.size(); ++i) {
         mDicts[i]->AttachToDocument(doc);
@@ -2246,6 +2376,8 @@ inline void Asset::ReadExtensionsRequired(Document &doc) {
     CHECK_REQUIRED_EXT(KHR_draco_mesh_compression);
     CHECK_REQUIRED_EXT(KHR_texture_basisu);
     CHECK_REQUIRED_EXT(EXT_texture_webp);
+    CHECK_REQUIRED_EXT(EXT_meshopt_compression);
+    CHECK_REQUIRED_EXT(KHR_meshopt_compression);
 
 #undef CHECK_REQUIRED_EXT
 }
@@ -2277,6 +2409,8 @@ inline void Asset::ReadExtensionsUsed(Document &doc) {
     CHECK_EXT(KHR_draco_mesh_compression);
     CHECK_EXT(KHR_texture_basisu);
     CHECK_EXT(EXT_texture_webp);
+    CHECK_EXT(EXT_meshopt_compression);
+    CHECK_EXT(KHR_meshopt_compression);
 
 #undef CHECK_EXT
 }

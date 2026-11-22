@@ -55,9 +55,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <rapidjson/schema.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 #include <assimp/material.h>
 #include <assimp/GltfMaterial.h>
@@ -1276,4 +1279,100 @@ TEST_F(utglTF2ImportExport, importAnimationInterpolationIsPreserved) {
                     << expected.file << " key " << i;
         }
     }
+}
+
+namespace {
+
+// Position, normal and texture coordinate of one vertex, rounded so that values which went
+// through a lossy meshopt filter still compare equal to the reference.
+using MeshoptTestVertex = std::array<long long, 8>;
+using MeshoptTestTriangle = std::array<MeshoptTestVertex, 3>;
+
+// Returns the triangles of a mesh in a canonical order. gltfpack reorders vertices and
+// indices, so the triangles are compared as a sorted list instead of by index.
+std::vector<MeshoptTestTriangle> GetSortedTriangles(const aiMesh *mesh) {
+    const auto quantize = [](ai_real v) { return static_cast<long long>(std::llround(v * 10000)); };
+
+    std::vector<MeshoptTestTriangle> triangles;
+    for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+        const aiFace &face = mesh->mFaces[f];
+        if (face.mNumIndices != 3) {
+            continue;
+        }
+        MeshoptTestTriangle triangle;
+        for (unsigned int k = 0; k < 3; ++k) {
+            const unsigned int index = face.mIndices[k];
+            const aiVector3D &p = mesh->mVertices[index];
+            const aiVector3D &n = mesh->mNormals[index];
+            const aiVector3D &t = mesh->mTextureCoords[0][index];
+            triangle[k] = { quantize(p.x), quantize(p.y), quantize(p.z),
+                quantize(n.x), quantize(n.y), quantize(n.z),
+                quantize(t.x), quantize(t.y) };
+        }
+        std::sort(triangle.begin(), triangle.end());
+        triangles.push_back(triangle);
+    }
+    std::sort(triangles.begin(), triangles.end());
+    return triangles;
+}
+
+} // namespace
+
+TEST_F(utglTF2ImportExport, importMeshoptCompression) {
+    // BoxTextured-glTF/BoxTextured.gltf compressed with gltfpack:
+    //   BoxTextured_EXT_meshopt.glb          -c -noq            ATTRIBUTES and TRIANGLES
+    //   BoxTextured_EXT_meshopt_filters.glb  -c -vpf -vnf -vtf  ATTRIBUTES with EXPONENTIAL filter
+    //   BoxTextured_KHR_meshopt.glb          -c -noq -ce khr    KHR_meshopt_compression
+    // All attributes stay FLOAT, so the decoded mesh must match the uncompressed original.
+    // The compressed data lives in buffer 0 (the GLB chunk) and is decoded into buffer 1,
+    // a fallback buffer without "uri".
+    // gltfpack bakes the node transform of the original into the vertices, so both scenes
+    // are compared after aiProcess_PreTransformVertices.
+    const unsigned int flags = aiProcess_ValidateDataStructure | aiProcess_PreTransformVertices;
+    Assimp::Importer reference;
+    const aiScene *referenceScene = reference.ReadFile(ASSIMP_TEST_MODELS_DIR "/glTF2/BoxTextured-glTF/BoxTextured.gltf", flags);
+    ASSERT_NE(nullptr, referenceScene) << reference.GetErrorString();
+    ASSERT_EQ(1u, referenceScene->mNumMeshes);
+    const aiMesh *referenceMesh = referenceScene->mMeshes[0];
+    const std::vector<MeshoptTestTriangle> expectedTriangles = GetSortedTriangles(referenceMesh);
+    ASSERT_EQ(12u, expectedTriangles.size());
+
+    const std::array<const char *, 3> files = { {
+        "/glTF2/BoxTextured-glTF-Meshopt/BoxTextured_EXT_meshopt.glb",
+        "/glTF2/BoxTextured-glTF-Meshopt/BoxTextured_EXT_meshopt_filters.glb",
+        "/glTF2/BoxTextured-glTF-Meshopt/BoxTextured_KHR_meshopt.glb",
+    } };
+
+    for (const char *file : files) {
+        Assimp::Importer importer;
+        const aiScene *scene = importer.ReadFile(std::string(ASSIMP_TEST_MODELS_DIR) + file, flags);
+#ifdef ASSIMP_ENABLE_MESHOPT
+        ASSERT_NE(nullptr, scene) << file << ": " << importer.GetErrorString();
+        ASSERT_EQ(1u, scene->mNumMeshes) << file;
+        const aiMesh *mesh = scene->mMeshes[0];
+        EXPECT_EQ(referenceMesh->mNumVertices, mesh->mNumVertices) << file;
+        ASSERT_EQ(referenceMesh->mNumFaces, mesh->mNumFaces) << file;
+        ASSERT_TRUE(mesh->HasNormals()) << file;
+        ASSERT_TRUE(mesh->HasTextureCoords(0)) << file;
+        EXPECT_EQ(expectedTriangles, GetSortedTriangles(mesh)) << file;
+
+        // The image is an uncompressed buffer view in the same GLB buffer.
+        EXPECT_EQ(1u, scene->mNumTextures) << file;
+#else
+        // The files list the extension as required, so they cannot be loaded without the decoder.
+        EXPECT_EQ(nullptr, scene) << file;
+#endif
+    }
+}
+
+TEST_F(utglTF2ImportExport, importMeshoptInvalidByteStride) {
+    // BoxTextured_EXT_meshopt.glb with byteStride 6 in the meshopt extension of the POSITION
+    // buffer view. meshoptimizer only checks the stride with assert(), so the importer has to
+    // reject the file before decoding.
+    Assimp::Importer importer;
+    const aiScene *scene = importer.ReadFile(ASSIMP_TEST_MODELS_DIR "/glTF2/BoxTextured-glTF-Meshopt/BoxTextured_EXT_meshopt_invalid_stride.glb", aiProcess_ValidateDataStructure);
+    EXPECT_EQ(nullptr, scene);
+#ifdef ASSIMP_ENABLE_MESHOPT
+    EXPECT_NE(std::string(importer.GetErrorString()).find("invalid byteStride"), std::string::npos) << importer.GetErrorString();
+#endif
 }

@@ -720,6 +720,11 @@ IF(ASSIMP_BUILD_DRACO_STATIC)
   SET(ASSIMP_BUILD_DRACO ON)
 ENDIF()
 
+# Decoder for EXT_meshopt_compression / KHR_meshopt_compression (glTF 2.0).
+# The few meshoptimizer source files needed for decoding are in contrib/meshoptimizer
+# and are compiled into assimp, so there is no external dependency.
+OPTION ( ASSIMP_BUILD_MESHOPT "Build the meshoptimizer decoder for glTF EXT_meshopt_compression" ON )
+
 # Draco requires cmake 3.12
 IF (DEFINED CMAKE_VERSION AND "${CMAKE_VERSION}" VERSION_LESS "3.12")
   MESSAGE(NOTICE "draco requires cmake 3.12 or newer, cmake is ${CMAKE_VERSION} . Draco is disabled")

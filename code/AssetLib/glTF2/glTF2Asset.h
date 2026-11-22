@@ -519,6 +519,15 @@ public:
 
     uint8_t *GetPointer() { return mData.get(); }
 
+    /// Allocates a zero-filled buffer of the given length.
+    /// Used for the fallback buffer of EXT_meshopt_compression, which has no "uri" and no
+    /// GLB chunk; its content is produced by decoding the compressed buffer views.
+    void AllocateZeroed(size_t length) {
+        byteLength = length;
+        capacity = length;
+        mData.reset(new uint8_t[length](), std::default_delete<uint8_t[]>());
+    }
+
     void MarkAsSpecial() { mIsSpecial = true; }
 
     bool IsSpecial() const override { return mIsSpecial; }
@@ -539,6 +548,10 @@ struct BufferView : public Object {
 
     void Read(Value &obj, Asset &r);
     uint8_t *GetPointerAndTailSize(size_t accOffset, size_t& outTailSize);
+
+    /// Decodes this EXT_meshopt_compression / KHR_meshopt_compression buffer view into
+    /// its (fallback) buffer, so that accessors can read it like uncompressed data.
+    void DecodeMeshopt(Value &extension, Asset &r);
 };
 
 //! A typed view into a BufferView. A BufferView contains raw binary data.
@@ -1139,6 +1152,8 @@ public:
         bool FB_ngon_encoding{false};
         bool KHR_texture_basisu{false};
         bool EXT_texture_webp{false};
+        bool EXT_meshopt_compression{false};
+        bool KHR_meshopt_compression{false};
 
         Extensions() = default;
         ~Extensions() = default;
@@ -1149,6 +1164,8 @@ public:
         bool KHR_draco_mesh_compression{false};
         bool KHR_texture_basisu{false};
         bool EXT_texture_webp{false};
+        bool EXT_meshopt_compression{false};
+        bool KHR_meshopt_compression{false};
 
         RequiredExtensions() = default;
     } extensionsRequired;

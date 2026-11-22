@@ -1590,6 +1590,20 @@ IF (ASSIMP_BUILD_DRACO)
   ADD_DEFINITIONS( -DASSIMP_ENABLE_DRACO )
 ENDIF()
 
+# meshoptimizer decoder for glTF EXT_meshopt_compression / KHR_meshopt_compression
+IF (ASSIMP_BUILD_MESHOPT)
+  SET( meshopt_SRCS
+    ../contrib/meshoptimizer/meshoptimizer.h
+    ../contrib/meshoptimizer/vertexcodec.cpp
+    ../contrib/meshoptimizer/indexcodec.cpp
+    ../contrib/meshoptimizer/vertexfilter.cpp
+  )
+  SOURCE_GROUP( Contrib\\meshoptimizer FILES ${meshopt_SRCS} )
+  SET( assimp_src ${assimp_src} ${meshopt_SRCS} )
+  INCLUDE_DIRECTORIES( ../contrib/meshoptimizer )
+  ADD_DEFINITIONS( -DASSIMP_ENABLE_MESHOPT )
+ENDIF()
+
 ADD_LIBRARY( assimp ${assimp_src} )
 ADD_LIBRARY(assimp::assimp ALIAS assimp)
 
